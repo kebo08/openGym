@@ -65,19 +65,22 @@ official v1.4.2 frontend and exercise media.
   take 50 seconds or more. The database, rather than the temporary Render
   filesystem, stores profiles, credentials and exercise data.
 
-## Remaining user steps
+## Connected and verified
 
-The live app's owner registration form is prepared in Brave with the private
-bootstrap invite. The user must click **Create passkey** and complete device
-authentication. No owner profile or paired client has been created yet.
+- The user created the owner profile and passkey, then confirmed connecting the
+  existing APK with its own single-use pairing code. The browser account reports
+  **All synced**.
+- A separate local Codex API session was paired. The credential is stored only in
+  ignored `.opengym/codex-session.json`; no token is committed or printed.
+- The Codex helper verified the same owner profile and read **3 routines at
+  revision 1** from the live server. No exercise-plan changes were made.
+- Render recorded **Service restarted by you** at 20:41 IST on 23 October 2026.
+  After that restart, the existing bearer credential still authenticated the same
+  owner, the 3 routines remained at revision 1, and health reported one user with
+  writable storage. Browser sync also remained signed in.
 
-1. Complete owner passkey creation. Then generate a five-minute mobile pairing
-   code in Settings > Account > Pair the mobile app.
-2. In the existing APK, use Settings > Account > Connect to my server. Enter the
-   HTTPS origin above and the pairing code. Verify actual phone sync before
-   considering the connection complete; the URL alone does not authenticate.
-3. Pair a separate Codex client session when plan management is requested. Keep
-   credentials in the ignored `.opengym/` directory and out of plan exports.
-4. Confirm live account/session persistence after a controlled service restart.
-   Fresh-filesystem persistence already passed locally, but has not yet been
-   exercised with a real owner profile on the hosted service.
+Hosting and client setup are complete. The next step is to collect training goals,
+experience, availability, equipment and movement restrictions, then review and
+apply the requested plan through the helper. Existing workouts and weigh-ins are
+preserved by its plan-update workflow. Actual phone rendering of a future Codex
+plan update will be checked when the first requested plan is applied.
