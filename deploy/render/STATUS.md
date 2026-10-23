@@ -46,30 +46,38 @@ startup timeouts. Final results above use native Linux files with Linux checkout
 line endings. No frontend source was changed; the image uses the digest-pinned
 official v1.4.2 frontend and exercise media.
 
-## Remaining external steps
+## Live deployment
 
-**No hosted API URL exists yet. No Neon project or Render service has been
-created. No paid resources were created.**
+**API and app origin: https://opengym-elvn.onrender.com**
 
-Brave is now connected. Created the user's public fork at
-https://github.com/kebo08/openGym and pushed the tested
-`codex/render-free-postgres` branch (implementation commit `e50b8305`). Render's
-Blueprint form is prepared for that repository/branch with name `opengym-free`.
-It successfully reads `render.yaml` and is waiting for `DATABASE_URL`.
+- Source: https://github.com/kebo08/openGym, branch
+  `codex/render-free-postgres`; deployed commit `74a018a`.
+- Render Blueprint `opengym-free`, service `opengym`, **Free** compute in Singapore.
+  Deployment `dep-dbdn9q0473hc73cvk61g` succeeded in 1m22s on 23 October 2026.
+- Neon organization `OpenGym Personal`, project/database `opengym`, **Free** plan,
+  PostgreSQL 16 in AWS Singapore. The pooled connection is stored only in Render's
+  secret environment setting. No paid resources were created.
+- Public HTTPS verification passed: `/api/health` returned 200 with `ok: true`,
+  `users: 0`, `writable: true`; `/api/config` confirmed invite-only registration;
+  unauthenticated `/api/data` returned 401; the frontend and bundled exercise
+  media returned 200. Render marked the deployment Live.
+- Free instances sleep with inactivity; Render warns that wake-up requests can
+  take 50 seconds or more. The database, rather than the temporary Render
+  filesystem, stores profiles, credentials and exercise data.
 
-Neon is open in the same Brave profile at its sign-in screen. The user has been
-asked to finish sign-in/sign-up there, keeping the Free plan. Render and Neon tabs
-are preserved for continuation; no password or database URL has been requested in
-chat.
+## Remaining user steps
 
-1. The user signs in to Neon, then the agent creates a Free project. Authentication and any terms
-   requiring the account holder must be completed by the user. Keep its connection
-   string in server secret settings, outside source and chat.
-2. Create the prepared Free Render Blueprint with the Neon `DATABASE_URL`.
-   Verify TLS, health and restart behavior
-   on the actual services. Local checks do not prove cloud deployment.
-3. The user creates the private owner profile with the bootstrap invitation, then
-   pairs the existing APK using the hosted HTTPS origin and a five-minute code.
-   Verify actual phone sync before considering the setup complete.
-4. Pair a separate Codex client session when plan management is requested. Keep
+The live app's owner registration form is prepared in Brave with the private
+bootstrap invite. The user must click **Create passkey** and complete device
+authentication. No owner profile or paired client has been created yet.
+
+1. Complete owner passkey creation. Then generate a five-minute mobile pairing
+   code in Settings > Account > Pair the mobile app.
+2. In the existing APK, use Settings > Account > Connect to my server. Enter the
+   HTTPS origin above and the pairing code. Verify actual phone sync before
+   considering the connection complete; the URL alone does not authenticate.
+3. Pair a separate Codex client session when plan management is requested. Keep
    credentials in the ignored `.opengym/` directory and out of plan exports.
+4. Confirm live account/session persistence after a controlled service restart.
+   Fresh-filesystem persistence already passed locally, but has not yet been
+   exercised with a real owner profile on the hosted service.
