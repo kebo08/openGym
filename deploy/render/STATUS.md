@@ -48,25 +48,28 @@ official v1.4.2 frontend and exercise media.
 
 ## Remaining external steps
 
-**No hosted API URL exists yet. No Neon project, Render service or remote GitHub
-repository/branch has been created or pushed. No paid resources were created.**
+**No hosted API URL exists yet. No Neon project or Render service has been
+created. No paid resources were created.**
 
-Browser discovery returned no connected browsers; the Windows helper reported
-`native pipe unavailable`. Direct Neon/Render connectors are unavailable under the
-current administrator policy. User browser access is required to proceed.
+Brave is now connected. Created the user's public fork at
+https://github.com/kebo08/openGym and pushed the tested
+`codex/render-free-postgres` branch (implementation commit `e50b8305`). Render's
+Blueprint form is prepared for that repository/branch with name `opengym-free`.
+It successfully reads `render.yaml` and is waiting for `DATABASE_URL`.
 
-1. Connect Brave to the session. The official setup is desktop app **Settings →
-   Computer Use → More browsers → Brave**, install/connect its extension, confirm
-   **Manage**, then select the browser or Render tab with an `@` mention.
-   [Official browser-extension setup](https://learn.chatgpt.com/docs/chrome-extension).
-2. Create/sign in to Neon and create a Free project. Authentication and any terms
+Neon is open in the same Brave profile at its sign-in screen. The user has been
+asked to finish sign-in/sign-up there, keeping the Free plan. Render and Neon tabs
+are preserved for continuation; no password or database URL has been requested in
+chat.
+
+1. The user signs in to Neon, then the agent creates a Free project. Authentication and any terms
    requiring the account holder must be completed by the user. Keep its connection
    string in server secret settings, outside source and chat.
-3. Publish this branch to the user's repository and create the Free Render
-   Blueprint with the Neon `DATABASE_URL`. Verify TLS, health and restart behavior
+2. Create the prepared Free Render Blueprint with the Neon `DATABASE_URL`.
+   Verify TLS, health and restart behavior
    on the actual services. Local checks do not prove cloud deployment.
-4. The user creates the private owner profile with the bootstrap invitation, then
+3. The user creates the private owner profile with the bootstrap invitation, then
    pairs the existing APK using the hosted HTTPS origin and a five-minute code.
    Verify actual phone sync before considering the setup complete.
-5. Pair a separate Codex client session when plan management is requested. Keep
+4. Pair a separate Codex client session when plan management is requested. Keep
    credentials in the ignored `.opengym/` directory and out of plan exports.
