@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { buildPlanBundle, parsePlan } from '../frontend/src/lib/plan-share.js';
+import { stampChange } from '../frontend/src/lib/sync-merge.js';
 
 export function serverOrigin(value, { allowLocalHttp = false } = {}) {
   const u = new URL(value);
@@ -97,12 +98,27 @@ export function createClient({ server, token, allowLocalHttp = false, fetchImpl 
       for (const [day, value] of Object.entries(parsed.week)) {
         if (!/^[0-6]$/.test(day) || ![].concat(value).every(id => ids.has(id))) throw new Error('The weekly schedule references an invalid routine or day');
       }
-      const customs = new Map((current.customEx || []).map(e => [e.id, e]));
-      for (const ex of parsed.customEx) customs.set(ex.id, { ...customs.get(ex.id), ...ex, custom: true });
       // Always start from the latest full document: workouts and weigh-ins can advance
       // after the export without being replaced by the plan file's older view.
-      const next = { ...current, routines: parsed.routines, week: parsed.week, customEx: [...customs.values()], _ts: Date.now() };
-      const result = await request('/api/data', { state: next, baseRev: rev, ...(current._wid ? { baseWid: current._wid } : {}) });
+      const next = structuredClone(current);
+      const priorRoutines = new Map((next.routines || []).map(r => [r.id, r]));
+      next.routines = parsed.routines.map(r => {
+        // Shared plan files omit sync stamps and app-only routine metadata. Keep that
+        // metadata from the same live routine, while replacing the plan's own fields.
+        const retained = priorRoutines.get(r.id) || {};
+        for (const key of ['name', 'emoji', 'prog', 'excludeFromProgression', 'ex']) delete retained[key];
+        const { _ts, _f, _u, ...planned } = r;
+        return { ...retained, ...structuredClone(planned) };
+      });
+      next.week = structuredClone(parsed.week);
+      const customs = new Map((next.customEx || []).map(e => [e.id, e]));
+      for (const ex of parsed.customEx) customs.set(ex.id, { ...customs.get(ex.id), ...structuredClone(ex), custom: true });
+      next.customEx = [...customs.values()];
+      // Use the APK's own stamping rules. The server's legacy-writer heuristics can
+      // otherwise restore an earlier field value when a plan file omitted its stamps.
+      next._ts = stampChange(current, next);
+      const result = await request('/api/data', { state: next, stamped: true, baseRev: rev,
+        ...(current._wid ? { baseWid: current._wid } : {}) });
       return { revision: result.rev, routines: parsed.routines.length };
     }
   };

@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createClient, serverOrigin } from '../opengym-client.mjs';
+import { stampPut } from '../../api/sync-stamps.js';
+import { stampChange, mergeStates } from '../../frontend/src/lib/sync-merge.js';
+import { canonicalExId } from '../../frontend/src/lib/exercises.js';
 
 const SERVER = 'https://gym.example.com';
 const initial = () => ({ unit: 'kg', _rev: 3, _wid: 'original', _ts: 100,
@@ -27,7 +30,17 @@ function fixture() {
       else if (options.method === 'PUT') {
         f.put = JSON.parse(options.body);
         if (f.conflict) { status = 409; data = { error: 'conflict', state: f.state, rev: f.state._rev }; }
-        else { f.state = f.put.state; data = { ok: true, rev: f.state._rev + 1 }; }
+        else {
+          const before = f.state;
+          f.state = f.put.state;
+          const report = {};
+          if (f.serverStamps) stampPut(before, f.state, {
+            overRead: f.put.baseRev === before._rev, stamped: f.put.stamped === true, report
+          });
+          const rev = before._rev + 1;
+          if (f.serverStamps) f.state._rev = rev + (report.changed ? 1 : 0);
+          data = { ok: true, rev };
+        }
       } else data = { state: structuredClone(f.state), rev: f.state._rev };
     }
     return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
@@ -102,4 +115,61 @@ test('a concurrent server conflict is returned without an automatic overwriting 
   f.conflict = true;
   await assert.rejects(f.client.applyPlan(plan), e => e.status === 409);
   assert.equal(f.calls.filter(call => call.options.method === 'PUT').length, 1);
+});
+
+test('a previously edited routine can return to an earlier prescription and survives a newer offline phone workout', async () => {
+  const f = fixture();
+  f.serverStamps = true;
+  const before = initial();
+  before.edited = { 'week.1': 100 };
+  before.routines[0].ex[0].id = canonicalExId(before.routines[0].ex[0].id);
+  before.routines[0]._ts = 100;
+  before.routines[0]._f = { ex: 100, displayMeta: 100 };
+  before.routines[0].displayMeta = { color: 'blue', source: 'phone' };
+  const current = structuredClone(before);
+  current.routines[0].ex[0].reps = 12;
+  current._ts = stampChange(before, current, 200);
+  stampPut(before, current, { overRead: true, stamped: true, now: 200 });
+  f.state = current;
+  const stalePhone = structuredClone(current);
+  const plan = await f.client.exportPlan();
+  plan.routines[0].ex[0].reps = 8; // an intentional return to the previous value
+  await f.client.applyPlan(plan);
+  assert.equal(f.put.stamped, true);
+  assert.equal(f.state.routines[0].ex[0].reps, 8, 'legacy repair must not silently restore the old 12-rep prescription');
+  assert.ok(f.state.routines[0]._f.ex > current.routines[0]._f.ex);
+  assert.deepEqual(f.state.routines[0].displayMeta, before.routines[0].displayMeta, 'app-only metadata stays on the same routine');
+  assert.equal(f.state.routines[0]._f.displayMeta, 100, 'unchanged metadata keeps its field stamp');
+
+  // The disconnected phone's global timestamp is now newer, but its routine field
+  // is older. The actual APK merge must keep both the plan edit and the new workout.
+  const later = f.state._ts + 1000;
+  stalePhone.workouts.push({ id: 'offline-workout', d: '2026-10-24', _ts: later, entries: [] });
+  stalePhone._ts = stampChange(current, stalePhone, later);
+  const merged = mergeStates(stalePhone, f.state);
+  assert.equal(merged.routines.find(r => r.id === 'r1').ex[0].reps, 8);
+  assert.ok(merged.workouts.some(w => w.id === 'offline-workout'));
+  assert.ok(merged.workouts.some(w => w.id === 'w1'));
+});
+
+test('routine removals and replacement weekdays stay removed when a stale phone reconnects', async () => {
+  const f = fixture();
+  f.serverStamps = true;
+  f.state.edited = { 'week.1': 100, 'week.2': 100 };
+  f.state.routines.push({ id: 'obsolete', name: 'Old session', _ts: 100,
+    ex: [{ id: canonicalExId('0025'), sets: 2, reps: 10 }] });
+  f.state.week[2] = ['obsolete'];
+  const stalePhone = structuredClone(f.state);
+  const plan = await f.client.exportPlan();
+  plan.routines = plan.routines.filter(r => r.id !== 'obsolete');
+  plan.week = { 1: ['r1'], 4: ['r1'] };
+  await f.client.applyPlan(plan);
+  assert.ok(f.state.deleted.routines.obsolete > 100, 'removal has its own tombstone');
+  assert.ok(f.state.edited['week.2'] > 100, 'clearing a weekday is stamped');
+  assert.ok(f.state.edited['week.4'] > 100, 'the new weekday is stamped');
+  stalePhone._ts = f.state._ts + 1000;
+  const merged = mergeStates(stalePhone, f.state);
+  assert.equal(merged.routines.some(r => r.id === 'obsolete'), false);
+  assert.equal(merged.week[2], undefined);
+  assert.deepEqual(merged.week[4], ['r1']);
 });
