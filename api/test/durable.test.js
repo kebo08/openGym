@@ -27,7 +27,10 @@ test('atomicWrite: bytes flushed, then the rename, then the directory', t => {
 
 test('server.js and media.js write through it', () => {
   const server = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
-  assert.match(server, /function atomicWrite\(file, content, mode\) \{ durableWrite\(file, content, mode\); \}/);
+  // The wrapper also dispatches PostgreSQL writes. File mode must still end at the
+  // durable writer; its exact one-line formatting is not part of that contract.
+  const wrapper = server.slice(server.indexOf('function atomicWrite(file, content, mode)'), server.indexOf('// How many earlier write ids'));
+  assert.match(wrapper, /durableWrite\(file, content, mode\);\s*\}/);
   const media = fs.readFileSync(new URL('../media.js', import.meta.url), 'utf8');
   assert.match(media, /syncFile\(tmp\);[\s\S]*fs\.renameSync\(tmp, path\.join\(e\.dir/);
 });

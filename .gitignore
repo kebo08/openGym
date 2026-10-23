@@ -8,6 +8,7 @@ data/
 
 # Local config
 .env
+.opengym/
 
 # Build output / deps
 frontend/dist/

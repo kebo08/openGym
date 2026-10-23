@@ -36,9 +36,42 @@ import { effectiveRoutineId } from './queue.js';
 import { stampPut } from './sync-stamps.js';
 import { atomicWrite as durableWrite } from './durable.js';
 import { excusedOn, nudgeFor, nudgeWindowOpen, toneOf } from './nudge.js';
+import { PostgresStorage } from './storage/postgres.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
+// PostgreSQL is optional. This first backend deliberately excludes server-side AI jobs,
+// uploads and background push scheduling, whose files/timers cannot survive free-host sleep.
+const PG_MODE = !!process.env.DATABASE_URL;
+// Render-generated secrets can exceed the stock client's 40-character invite input.
+// A 32-character prefix retains ample entropy and matches registration's uppercase form.
+const BOOTSTRAP_INVITE = process.env.OPENGYM_BOOTSTRAP_INVITE?.trim().slice(0, 32).toUpperCase();
+if (PG_MODE && BOOTSTRAP_INVITE !== undefined && BOOTSTRAP_INVITE.length < 16) {
+  throw new Error('OPENGYM_BOOTSTRAP_INVITE must contain at least 16 characters');
+}
+if (PG_MODE && (!/^(0|false|no|off)$/i.test(process.env.MEDIA_UPLOADS || '')
+  || !/^(1|true|yes|on)$/i.test(process.env.COACH_DISABLED || ''))) {
+  throw new Error('DATABASE_URL requires MEDIA_UPLOADS=0 and COACH_DISABLED=1');
+}
+let PG = null;
+let persistedInstance = null;
+if (PG_MODE) {
+  try {
+    PG = new PostgresStorage({ connectionString: process.env.DATABASE_URL,
+      schema: process.env.OPENGYM_DATABASE_SCHEMA || 'public' });
+    persistedInstance = await PG.initialize(() => ({
+      db: { users: [], creds: [], subs: [], deviceLinks: [],
+        invites: BOOTSTRAP_INVITE ? [{
+          code: BOOTSTRAP_INVITE, note: 'Bootstrap owner',
+          created: new Date().toISOString(), createdBy: 'bootstrap'
+        }] : [] },
+      secret: crypto.randomBytes(32).toString('hex'), vapid: webpush.generateVAPIDKeys(), auditSeq: 0
+    }));
+  } catch {
+    console.error('PostgreSQL startup failed; refusing to start without authoritative storage');
+    process.exit(1);
+  }
+}
 const RP_ID = process.env.RP_ID || 'localhost';
 const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
 const RP_NAME = process.env.RP_NAME || 'openGym';
@@ -113,8 +146,8 @@ const lock = f => { try { fs.chmodSync(path.join(DATA, f), 0o600); } catch { /* 
 
 /* ---------- secret + db ---------- */
 const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
+if (!PG && !fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
+const SECRET = PG ? persistedInstance.secret : fs.readFileSync(secretFile, 'utf8').trim();
 
 const dbFile = path.join(DATA, 'db.json');
 // Every account, passkey and invite. Only a missing file starts empty: an unreadable one (a write
@@ -142,7 +175,7 @@ function loadDb() {
     }
   }
 }
-let db = loadDb();
+let db = PG ? persistedInstance.db : loadDb();
 db.users = db.users || [];
 db.creds = db.creds || [];
 db.subs = db.subs || [];
@@ -172,6 +205,7 @@ const isOwner = user => !!user && isAdmin(user) && user.id === ownerId();
 // whatever the last save wrote (a profile just created) when db.json was later found unreadable.
 // A write cut short leaves the previous db.json.bak whole (temporary file and rename).
 function saveDb() {
+  if (PG) { PG.saveDb(db); return; }
   const text = JSON.stringify(db, null, 2);
   atomicWrite(dbFile, text, 0o600);
   try { atomicWrite(dbFile + '.bak', text, 0o600); }
@@ -179,7 +213,15 @@ function saveDb() {
 }
 // Flushed before and after the rename (durable.js): a host reset must not bring back the file
 // the client was told had been replaced.
-function atomicWrite(file, content, mode) { durableWrite(file, content, mode); }
+function atomicWrite(file, content, mode) {
+  if (PG) {
+    const match = /^state-([a-zA-Z0-9_-]+)\.json$/.exec(path.basename(file));
+    if (!match) throw new Error('unsupported PostgreSQL file write');
+    PG.writeState(match[1], JSON.parse(content));
+    return;
+  }
+  durableWrite(file, content, mode);
+}
 // How many earlier write ids a document keeps (`_wids`, see PUT /api/data): a device that last
 // synced more writes ago than this merges on its next pull instead of taking the server's copy.
 const WID_KEEP = 50;
@@ -197,6 +239,7 @@ function notePull(user, now = Date.now()) {
 // The later of the last push and the last pull.
 const lastSyncOf = (u, S) => Math.max(S?._ts || 0, u?.lastPull || 0) || null;
 function readState(uid) {
+  if (PG) return PG.readState(uid);
   try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
 }
 // GET and PUT /api/data tell a profile with no state yet from one whose file cannot be read: the
@@ -204,6 +247,7 @@ function readState(uid) {
 // replace, losing what a restore could still bring back.
 const UNREADABLE = Symbol('unreadable');
 function readStateStrict(uid) {
+  if (PG) return PG.readState(uid);
   let raw;
   try { raw = fs.readFileSync(stateFile(uid), 'utf8'); }
   catch (e) { return e.code === 'ENOENT' ? null : UNREADABLE; }
@@ -229,8 +273,11 @@ const records = v => (Array.isArray(v) ? v.filter(record) : []);
 /* ---------- push notifications (Web Push / VAPID) ---------- */
 const vapidFile = path.join(DATA, 'vapid.json');
 let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+if (PG) vapid = persistedInstance.vapid;
+else {
+  try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
+  catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+}
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
@@ -502,6 +549,7 @@ const STATE_CACHE_MAX = 64;
 const STATE_CACHE_TTL_MS = Math.max(50, +(process.env.STATE_CACHE_TTL_MS || 600000) || 600000);
 const stateCache = new Map(); // uid -> { mtimeMs, size, hitAt, S }
 function readStateCached(uid) {
+  if (PG) return PG.readState(uid);
   let st;
   try { st = fs.statSync(stateFile(uid)); } catch { stateCache.delete(uid); return null; }
   const now = Date.now();
@@ -544,6 +592,10 @@ function nudgeTick(user, S, now) {
 // user's windows is open and something could still be sent.
 const stateSummaries = new Map(); // uid -> { mtimeMs, size, rem, consent, settled }
 function stateSummary(uid) {
+  if (PG) {
+    const S = PG.readState(uid);
+    return S ? { rem: S.reminder || { on: false }, consent: !!S.coach?.consent?.agreedAt, settled: '' } : null;
+  }
   let st;
   try { st = fs.statSync(stateFile(uid)); } catch { stateSummaries.delete(uid); return null; }
   const had = stateSummaries.get(uid);
@@ -560,6 +612,7 @@ function stateSummary(uid) {
   return sum;
 }
 setInterval(() => {
+  if (PG) return; // Native reminders remain on the phone; no scheduled server jobs in this mode.
   for (const user of db.users) {
     if (user.disabled) continue;            // locked out everywhere, reminders included
     if (!db.subs.some(s => s.userId === user.id)) continue;
@@ -836,7 +889,9 @@ setInterval(() => { for (const [k, v] of pairings) if (v.exp < Date.now()) pairi
 /* ---------- helpers ---------- */
 function json(res, code, obj, extraHeaders) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(extraHeaders || {}) });
+  const headers = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(extraHeaders || {}) };
+  if (PG?.active) { res.pgReply = { code, headers, body }; return; }
+  res.writeHead(code, headers);
   res.end(body);
 }
 // A request the caller got wrong. The catch-all at the bottom answers it with this status and
@@ -847,6 +902,8 @@ class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 function readBody(req) {
+  if (req.pgBodyResult) return req.pgBodyResult.error
+    ? Promise.reject(req.pgBodyResult.error) : Promise.resolve(req.pgBodyResult.value);
   return new Promise((resolve, reject) => {
     let size = 0, over = false; const chunks = [];
     req.on('data', d => {
@@ -970,6 +1027,7 @@ function clientIp(req) {
 }
 
 function auditLines() {
+  if (PG) return PG.auditLines();
   let text;
   try { text = fs.readFileSync(auditFile, 'utf8'); } catch { return []; }
   const rows = [];
@@ -992,7 +1050,10 @@ function compactAudit() {
   const keep = auditKeep(rows);
   auditCount = keep.length;
   if (keep.length === rows.length) return;
-  try { atomicWrite(auditFile, keep.map(r => JSON.stringify(r)).join('\n') + (keep.length ? '\n' : '')); }
+  try {
+    if (PG) PG.replaceAudit(keep);
+    else atomicWrite(auditFile, keep.map(r => JSON.stringify(r)).join('\n') + (keep.length ? '\n' : ''));
+  }
   catch (e) { console.error('audit compact failed', e.message); }
 }
 
@@ -1011,12 +1072,15 @@ function audit(req, ev, f = {}) {
   if (f.act) rec.act = String(f.act).slice(0, 40);
   const ip = clientIp(req);
   if (ip) rec.ip = ip;
-  try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); }
+  try {
+    if (PG) PG.appendAudit(rec);
+    else fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n');
+  }
   catch (e) { return console.error('audit write failed', e.message); }
   // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
   if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
 }
-if (AUDIT_ON) {
+if (AUDIT_ON && !PG) {
   compactAudit();                                // prune on boot, seed auditSeq/auditCount
   setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
 }
@@ -1370,7 +1434,8 @@ function removeAccount(u) {
   dropDeviceLinks(db, u.id);
   presence.delete(u.id);
   // The training history and any Coach credential of theirs, both outside db.json.
-  try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ }
+  if (PG) PG.deleteState(u.id);
+  else try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ }
   try { coachConfig.clearProfileAuth(u.id); } catch { /* nothing stored */ }
   // Their photos and videos — the one place a profile's folder under uploads/ is removed.
   try { MEDIA.removeUser(u.id); } catch (e) { console.error('media: could not remove uploads of', u.id, e.message); }
@@ -2055,6 +2120,12 @@ const mediaRoutes = {
 const DATA_PROBE_MS = 5000;
 let dataProbe = { at: 0, ok: false };
 function dataWritable() {
+  if (PG) {
+    // The held reply also waits for this no-op UPDATE/commit, checking write permission
+    // and deferred constraints rather than merely a successful connection/SELECT.
+    PG.saveDb(db);
+    return PG.active;
+  }
   const now = Date.now();
   if (dataProbe.at && now - dataProbe.at < DATA_PROBE_MS) return dataProbe.ok;
   const probe = path.join(DATA, '.health-' + process.pid);
@@ -2606,6 +2677,7 @@ const routes = {
   'POST /api/push/rest-timer': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
+    if (PG) return json(res, 503, { error: 'server push timers are unavailable in PostgreSQL mode; use native reminders' });
     if (pushThrottled(res, REST_TIMER_SETS, user)) return;
     const body = await readBody(req);
     // Validated before it is clamped: the clamp used to run first, which turned a missing or
@@ -2837,7 +2909,8 @@ const routes = {
   // Owner only: an admin who could clear it could erase the trace of what they did.
   'POST /api/admin/audit/clear': async (req, res) => {
     const admin = requireOwner(req, res); if (!admin) return;
-    try { fs.unlinkSync(auditFile); } catch { /* nothing logged yet */ }
+    if (PG) PG.replaceAudit([]);
+    else try { fs.unlinkSync(auditFile); } catch { /* nothing logged yet */ }
     auditCount = 0;
     audit(req, 'admin.audit.clear', { user: admin });
     json(res, 200, { ok: true });
@@ -2858,7 +2931,7 @@ const routes = {
 /* ---------- Coach: boot recovery, notifications, scheduled reviews ---------- */
 // A job that was running when the process died is not coming back; say so rather than leaving
 // a spinner that never resolves.
-coachJobs.recoverOnBoot();
+if (!PG) coachJobs.recoverOnBoot();
 // A ready proposal is the one Coach event worth a notification. Failures and "nothing to
 // change" stay silent on purpose (FR-38/E4).
 coachJobs.setProposalHook((uid, pending) => {
@@ -2870,8 +2943,10 @@ coachJobs.setProposalHook((uid, pending) => {
     tag: 'coach-proposal', url: '#/coach'
   });
 });
-startCadence({ users: () => db.users.filter(u => !u.disabled), userNow, skip: uid => !stateSummary(uid)?.consent });
-startWarmup();
+if (!PG) {
+  startCadence({ users: () => db.users.filter(u => !u.disabled), userNow, skip: uid => !stateSummary(uid)?.consent });
+  startWarmup();
+}
 
 // node's requestTimeout is one number for every route, and it is half an hour (below) for the
 // sake of one: a video uploaded over a slow uplink. Every other request keeps node's old five
@@ -2897,7 +2972,7 @@ function bodyDeadline(req) {
 // The Capacitor WebView origins of the Android and iOS app.
 const APP_ORIGINS = new Set(['https://localhost', 'capacitor://localhost', 'http://localhost']);
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   bodyDeadline(req);
   // Same-origin (the deployed nginx-proxied web app) never triggers CORS, so this only matters
   // for the paired mobile app calling in from its own WebView origin. It carries no cookie
@@ -2940,6 +3015,9 @@ const server = http.createServer(async (req, res) => {
   if (mm) { key = req.method + ' /api/media/{hash}'; req.mediaHash = mm[1]; }
   const handler = routes[key];
   if (!handler) return json(res, 404, { error: 'not found' });
+  if (PG && /^\/api\/(?:admin\/)?coach(?:\/|$)/.test(url.pathname)) {
+    return json(res, 503, { error: 'server-side Coach is disabled in PostgreSQL mode' });
+  }
   if (!csrfOk(req, key)) {
     // A Bearer that does not verify and no cookie beside it: nothing ambient is in play, the caller
     // is simply not signed in. That is the paired app once its token is revoked or expired, and it
@@ -2981,6 +3059,47 @@ const server = http.createServer(async (req, res) => {
     }
     console.error(key, e);
     if (!res.headersSent) json(res, 500, { error: 'server error' });
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (!PG || req.method === 'OPTIONS') return handleRequest(req, res);
+  // Keep a storage-outage 503 readable by the paired app even when the transaction
+  // fails before the ordinary dispatcher gets to set its CORS headers.
+  const origin = req.headers.origin;
+  if (origin) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); }
+  // Read/limit JSON bodies before holding the database lock. Keep parse errors for the
+  // route that actually consumes the body, preserving endpoints that ignore it.
+  bodyDeadline(req);
+  if (!['GET', 'HEAD'].includes(req.method)) {
+    try { req.pgBodyResult = { value: await readBody(req) }; }
+    catch (error) { req.pgBodyResult = { error }; }
+  }
+  try {
+    const reply = await PG.transaction(async () => {
+      const previousDb = db, previousSeq = auditSeq, previousCount = auditCount;
+      db = PG.db;
+      auditSeq = PG.auditSeq;
+      auditCount = PG.auditLines().length;
+      try {
+        if (AUDIT_ON) compactAudit();
+        await handleRequest(req, res);
+        if (!res.pgReply) throw new Error('request could not complete');
+        if (res.pgReply.code >= 500) throw Object.assign(new Error('request refused'), { pgReply: res.pgReply });
+        return res.pgReply;
+      } finally {
+        // Only transaction-local objects carry authority; never publish a failed write.
+        db = previousDb; auditSeq = previousSeq; auditCount = previousCount;
+      }
+    });
+    if (!res.destroyed) { res.writeHead(reply.code, reply.headers); res.end(reply.body); }
+  } catch (error) {
+    if (!error.pgReply) console.error('PostgreSQL request failed; no success response sent');
+    delete res.pgReply;
+    if (!res.headersSent && !res.destroyed) {
+      if (error.pgReply) { res.writeHead(error.pgReply.code, error.pgReply.headers); res.end(error.pgReply.body); }
+      else json(res, 503, { error: 'storage unavailable', code: 'storage-unavailable' });
+    }
   }
 });
 // Node's default of 300 s for a whole request would answer 408 to a 40 MB video on a ~1 Mbit/s

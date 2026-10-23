@@ -3,5 +3,6 @@ frontend/dist
 media
 data
 .env
+.opengym
 .git
 *.log

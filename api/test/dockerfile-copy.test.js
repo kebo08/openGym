@@ -33,3 +33,19 @@ test('every root-level module server.js needs is on the Dockerfile COPY line', (
   assert.deepEqual(missing, [], `add ${missing.join(', ')} to the COPY line in api/Dockerfile`);
   for (const f of copied) assert.ok(fs.existsSync(path.join(API, f)), `${f} is copied but does not exist`);
 });
+
+test('runtime modules imported from subdirectories are included in the API image', () => {
+  const sources = read('Dockerfile').split('\n')
+    .filter(line => /^COPY\s+/.test(line))
+    .map(line => line.trim().split(/\s+/));
+  const modules = [...read('server.js').matchAll(/(?:from\s+|import\s*\(\s*)['"]\.\/([^'"]+\/[^'"]+\.js)['"]/g)]
+    .map(match => match[1]);
+  assert.ok(modules.length, 'the server imports runtime modules from subdirectories');
+  for (const module of modules) {
+    const directory = module.split('/')[0];
+    assert.ok(sources.some(parts => parts[1].replace(/\/$/, '') === directory
+      && parts.at(-1).replace(/^\.\//, '').replace(/\/$/, '') === directory),
+    `${module} needs its directory copied to the image`);
+    assert.ok(fs.existsSync(path.join(API, module)), `${module} must exist in the build context`);
+  }
+});

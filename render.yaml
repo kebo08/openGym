@@ -1,0 +1,33 @@
+# Strictly free Render compute. Supply a separately provisioned, durable free
+# PostgreSQL URL. No paid disk or expiring Render Free Postgres is created here.
+services:
+  - type: web
+    name: opengym
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: off
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: DATA_DIR
+        value: /tmp/opengym-data
+      - key: TRUST_PROXY
+        value: "1"
+      - key: FIRST_USER_ADMIN
+        value: "1"
+      - key: INVITE_ONLY
+        value: "1"
+      - key: OPENGYM_BOOTSTRAP_INVITE
+        generateValue: true
+      - key: COACH_DISABLED
+        value: "1"
+      - key: MEDIA_UPLOADS
+        value: "0"
